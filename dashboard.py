@@ -2,7 +2,8 @@
 Options Market Volume Dashboard
 ================================
 A production-quality, interactive Streamlit + Plotly dashboard for
-exploratory analysis of daily-aggregated options market volume data.
+exploratory analysis of daily-aggregated options market volume data,
+with support for multiple instruments (Index and Stock options).
 
 Run with:
     streamlit run dashboard.py
@@ -12,13 +13,14 @@ Expected input data
 A CSV (or an in-memory pandas DataFrame called `daily_volume`) with the
 following columns:
 
-    trd_date                (string, 'YYYY-MM-DD')
+    Date                (string, 'YYYY-MM-DD')
+    instrument          (string, 'OPTIDX' or 'OPTSTK')
     total_volume, total_call_volume, total_put_volume,
     itm_call_volume, atm_call_volume, otm_call_volume,
     itm_put_volume, atm_put_volume, otm_put_volume,
     itm_call_ratio, atm_call_ratio, otm_call_ratio,
     itm_put_ratio, atm_put_ratio, otm_put_ratio,
-    call_share, put_share, call_put_ratio
+    call_share, put_share, put_call_ratio
 
 If you already have `daily_volume` in memory (e.g. produced upstream in a
 notebook or ETL job), just persist it once and point the sidebar file
@@ -34,7 +36,7 @@ from __future__ import annotations
 
 import io
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,7 +60,8 @@ st.set_page_config(
 # ==========================================================================
 # Constants
 # ==========================================================================
-DATE_COL = "trd_date"
+DATE_COL = "Date"
+INSTRUMENT_COL = "instrument"
 
 VOLUME_COLS: List[str] = [
     "total_volume",
@@ -75,7 +78,7 @@ VOLUME_COLS: List[str] = [
 RATIO_COLS: List[str] = [
     "call_share",
     "put_share",
-    "call_put_ratio",
+    "put_call_ratio",
     "itm_call_ratio",
     "atm_call_ratio",
     "otm_call_ratio",
@@ -97,6 +100,12 @@ CORRELATION_COLS: List[str] = [
     "atm_put_ratio",
     "otm_put_ratio",
 ]
+
+# Instrument mapping
+INSTRUMENT_MAP: Dict[str, str] = {
+    "OPTIDX": "Index",
+    "OPTSTK": "Stock",
+}
 
 # Restrained, professional qualitative palette (Bloomberg / FT inspired)
 COLOR_PALETTE: List[str] = [
@@ -121,13 +130,6 @@ LEGEND_POSITIONS: Dict[str, dict] = {
 # ==========================================================================
 # Data loading & sample-data generation
 # ==========================================================================
-@st.cache_data(show_spinner=False)
-def load_data():
-    df = pd.read_csv("daily_volume.csv", parse_dates=["trd_date"])
-    return _optimize_dtypes(df)
-
-
-
 def _optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     """Downcast numeric dtypes to float32 where safe, cutting memory use
     roughly in half on large datasets without materially affecting the
@@ -145,8 +147,11 @@ def load_data(file_bytes: Optional[bytes]) -> pd.DataFrame:
     content so re-renders never re-parse an unchanged file."""
     if file_bytes is not None:
         df = pd.read_csv(io.BytesIO(file_bytes))
+    else:
+        # Fallback: return empty dataframe
+        return pd.DataFrame()
 
-    missing = [c for c in [DATE_COL] + ALL_NUMERIC_COLS if c not in df.columns]
+    missing = [c for c in [DATE_COL, INSTRUMENT_COL] + ALL_NUMERIC_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Dataset is missing required columns: {missing}")
 
@@ -156,7 +161,7 @@ def load_data(file_bytes: Optional[bytes]) -> pd.DataFrame:
     if len(df) < n_before:
         st.warning(f"Dropped {n_before - len(df):,} row(s) with unparsable '{DATE_COL}' values.")
 
-    df = df.sort_values(DATE_COL).reset_index(drop=True)
+    df = df.sort_values([DATE_COL, INSTRUMENT_COL]).reset_index(drop=True)
     df = _optimize_dtypes(df)
     return df
 
@@ -175,9 +180,9 @@ def aggregate_data(df: pd.DataFrame, freq_label: str) -> pd.DataFrame:
 
     out = (
         df.set_index(DATE_COL)
-        .resample(rule)
-        .agg(agg_map)
-        .dropna(how="all")
+        .groupby(INSTRUMENT_COL)
+        .apply(lambda x: x.resample(rule).agg(agg_map).dropna(how="all"))
+        .reset_index(level=0)
         .reset_index()
     )
     return out
@@ -199,8 +204,23 @@ def apply_rolling_average(
     target_cols = [
         c for c in columns if (c in RATIO_COLS) or (include_volumes and c in VOLUME_COLS)
     ]
-    for c in target_cols:
-        df[c] = df[c].rolling(window=window, min_periods=1).mean()
+    for instr in df[INSTRUMENT_COL].unique():
+        mask = df[INSTRUMENT_COL] == instr
+        for c in target_cols:
+            if c in df.columns:
+                df.loc[mask, c] = df.loc[mask, c].rolling(window=window, min_periods=1).mean()
+    return df
+
+
+def create_prefixed_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Create new columns with instrument prefixes for display in dropdowns."""
+    df = df.copy()
+    for idx, row in df.iterrows():
+        instrument_prefix = INSTRUMENT_MAP.get(row[INSTRUMENT_COL], row[INSTRUMENT_COL])
+        for col in ALL_NUMERIC_COLS:
+            if col in df.columns:
+                prefixed_col = f"{instrument_prefix} {col.replace('_', ' ').title()}"
+                df.loc[idx, prefixed_col] = df.loc[idx, col]
     return df
 
 
@@ -213,8 +233,7 @@ def format_axis_value(value: float, is_ratio: bool) -> str:
     return f"{value:.2%}" if is_ratio else f"{value:,.0f}"
 
 
-def hover_template_for(col: str) -> str:
-    is_ratio = col in RATIO_COLS
+def hover_template_for(col: str, is_ratio: bool) -> str:
     value_fmt = "%{y:.2%}" if is_ratio else "%{y:,.0f}"
     label = col.replace("_", " ").title()
     return f"<b>{label}</b><br>%{{x|%Y-%m-%d}}<br>{value_fmt}<extra></extra>"
@@ -243,16 +262,16 @@ def add_overlays(
     x: pd.Series,
     y: pd.Series,
     col: str,
+    label: str,
     color: str,
     overlays: Dict[str, bool],
     ma_window: int,
     secondary_y: bool,
+    is_ratio: bool,
 ) -> None:
     """Add any enabled statistical overlays (trend, moving average, mean,
     median, std band) as additional traces for a single variable."""
-    is_ratio = col in RATIO_COLS
     hover_fmt = "%{y:.2%}" if is_ratio else "%{y:,.0f}"
-    label = col.replace("_", " ").title()
 
     if overlays.get("trend"):
         x_numeric = (x - x.min()).dt.days.values.astype(float)
@@ -262,6 +281,7 @@ def add_overlays(
                 x=x, y=trend_y, mode="lines", name=f"{label} · trend",
                 line=dict(color=color, width=1.5, dash="dot"),
                 hovertemplate=f"<b>{label} trend</b><br>%{{x|%Y-%m-%d}}<br>{hover_fmt}<extra></extra>",
+                showlegend=True,
             ),
             secondary_y=secondary_y,
         )
@@ -273,6 +293,7 @@ def add_overlays(
                 x=x, y=ma_y, mode="lines", name=f"{label} · MA({ma_window})",
                 line=dict(color=color, width=1.5, dash="dash"),
                 hovertemplate=f"<b>{label} MA({ma_window})</b><br>%{{x|%Y-%m-%d}}<br>{hover_fmt}<extra></extra>",
+                showlegend=True,
             ),
             secondary_y=secondary_y,
         )
@@ -284,6 +305,7 @@ def add_overlays(
                 x=[x.min(), x.max()], y=[mean_val, mean_val], mode="lines",
                 name=f"{label} · mean", line=dict(color=color, width=1, dash="dashdot"),
                 hovertemplate=f"<b>{label} mean</b>: {format_axis_value(mean_val, is_ratio)}<extra></extra>",
+                showlegend=True,
             ),
             secondary_y=secondary_y,
         )
@@ -295,6 +317,7 @@ def add_overlays(
                 x=[x.min(), x.max()], y=[median_val, median_val], mode="lines",
                 name=f"{label} · median", line=dict(color=color, width=1, dash="longdash"),
                 hovertemplate=f"<b>{label} median</b>: {format_axis_value(median_val, is_ratio)}<extra></extra>",
+                showlegend=True,
             ),
             secondary_y=secondary_y,
         )
@@ -312,6 +335,7 @@ def add_overlays(
                 fill="toself", fillcolor=_hex_to_rgba(color, 0.12),
                 line=dict(width=0), hoverinfo="skip",
                 name=f"{label} · ±1 std",
+                showlegend=True,
             ),
             secondary_y=secondary_y,
         )
@@ -320,27 +344,37 @@ def add_overlays(
 # ==========================================================================
 # Main figure builder
 # ==========================================================================
-def build_main_figure(df: pd.DataFrame, variables: List[str], settings: Dict) -> go.Figure:
+def build_main_figure(
+    df: pd.DataFrame,
+    selected_vars: List[Tuple[str, str]],
+    settings: Dict,
+) -> go.Figure:
     """Construct the main interactive time-series figure from all sidebar
-    settings. Automatically routes ratio variables to a secondary y-axis
+    settings. selected_vars is a list of tuples (instrument, column).
+    Automatically routes ratio variables to a secondary y-axis
     (formatted as %) when both volume and ratio variables are selected
-    together, so the two scales never distort each other."""
-    has_volume = any(v in VOLUME_COLS for v in variables)
-    has_ratio = any(v in RATIO_COLS for v in variables)
+    together."""
+    has_volume = any(col in VOLUME_COLS for _, col in selected_vars)
+    has_ratio = any(col in RATIO_COLS for _, col in selected_vars)
     use_secondary = has_volume and has_ratio
 
     fig = make_subplots(specs=[[{"secondary_y": use_secondary}]])
 
     mode_map = {"Line": "lines", "Scatter": "markers", "Area": "lines"}
 
-    for i, col in enumerate(variables):
+    for i, (instrument, col) in enumerate(selected_vars):
         color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
         is_ratio = col in RATIO_COLS
         secondary_y = use_secondary and is_ratio
 
-        x = df[DATE_COL]
-        y = df[col]
-        label = col.replace("_", " ").title()
+        df_instr = df[df[INSTRUMENT_COL] == instrument].copy()
+        if df_instr.empty:
+            continue
+
+        x = df_instr[DATE_COL]
+        y = df_instr[col]
+        instrument_name = INSTRUMENT_MAP.get(instrument, instrument)
+        label = f"{instrument_name} {col.replace('_', ' ').title()}"
 
         mode = mode_map[settings["graph_type"]]
         if settings["show_markers"] and settings["graph_type"] != "Scatter":
@@ -351,7 +385,7 @@ def build_main_figure(df: pd.DataFrame, variables: List[str], settings: Dict) ->
             line=dict(width=settings["line_width"], color=color),
             marker=dict(size=6, color=color),
             opacity=settings["opacity"],
-            hovertemplate=hover_template_for(col),
+            hovertemplate=hover_template_for(col, is_ratio),
         )
         if settings["graph_type"] == "Area":
             trace_kwargs["fill"] = "tozeroy"
@@ -359,7 +393,11 @@ def build_main_figure(df: pd.DataFrame, variables: List[str], settings: Dict) ->
 
         fig.add_trace(go.Scatter(**trace_kwargs), secondary_y=secondary_y)
 
-        add_overlays(fig, x, y, col, color, settings["overlays"], settings["ma_window"], secondary_y)
+        add_overlays(
+            fig, x, y, col, label, color,
+            settings["overlays"], settings["ma_window"],
+            secondary_y, is_ratio,
+        )
 
     template = "plotly_dark" if settings["theme"] == "Dark" else "plotly_white"
     fig.update_layout(
@@ -395,12 +433,22 @@ def render_sidebar(df_full: pd.DataFrame) -> Dict:
     freq_label = st.sidebar.selectbox("Aggregation level", ["Daily", "Monthly", "Yearly"], index=0)
 
     st.sidebar.subheader("Variables")
-    variables = st.sidebar.multiselect(
+    instruments = df_full[INSTRUMENT_COL].unique() if not df_full.empty else []
+    
+    # Create instrument-prefixed options
+    options = []
+    for instr in sorted(instruments):
+        instr_name = INSTRUMENT_MAP.get(instr, instr)
+        for col in ALL_NUMERIC_COLS:
+            options.append((instr, col, f"{instr_name} {col.replace('_', ' ').title()}"))
+
+    selected_labels = st.sidebar.multiselect(
         "Select one or more variables to plot",
-        options=ALL_NUMERIC_COLS,
-        default=["total_volume"],
-        format_func=lambda c: c.replace("_", " ").title(),
+        options=[opt[2] for opt in options],
+        default=[options[0][2]] if options else [],
     )
+
+    selected_vars = [(opt[0], opt[1]) for opt in options if opt[2] in selected_labels]
 
     st.sidebar.subheader("Rolling Average")
     rolling_enabled = st.sidebar.checkbox("Enable rolling average", value=False)
@@ -432,7 +480,11 @@ def render_sidebar(df_full: pd.DataFrame) -> Dict:
     show_rangeslider = st.sidebar.checkbox("Show range slider under chart", value=True)
 
     st.sidebar.subheader("Date Range")
-    min_date, max_date = df_full[DATE_COL].min().date(), df_full[DATE_COL].max().date()
+    if not df_full.empty:
+        min_date, max_date = df_full[DATE_COL].min().date(), df_full[DATE_COL].max().date()
+    else:
+        min_date, max_date = date.today(), date.today()
+    
     date_range = st.sidebar.slider(
         "Date range slider", min_value=min_date, max_value=max_date,
         value=(min_date, max_date), format="YYYY-MM-DD",
@@ -461,7 +513,7 @@ def render_sidebar(df_full: pd.DataFrame) -> Dict:
 
     return dict(
         freq_label=freq_label,
-        variables=variables,
+        selected_vars=selected_vars,
         rolling_enabled=rolling_enabled,
         rolling_window_label=rolling_window_label,
         include_volumes_in_rolling=include_volumes_in_rolling,
@@ -488,9 +540,9 @@ def render_sidebar(df_full: pd.DataFrame) -> Dict:
 # Export controls
 # ==========================================================================
 def render_export_buttons(fig: go.Figure, key_prefix: str) -> None:
-    """Explicit PNG/HTML export buttons, in addition to the built-in
+    """Explicit PNG/HTML/SVG export buttons, in addition to the built-in
     camera icon already available in every Plotly chart's toolbar."""
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         try:
             png_bytes = fig.to_image(format="png", scale=2)
@@ -506,6 +558,15 @@ def render_export_buttons(fig: go.Figure, key_prefix: str) -> None:
             "⬇️ Export as HTML", data=html_bytes, file_name="chart.html",
             mime="text/html", key=f"{key_prefix}_html",
         )
+    with col3:
+        try:
+            svg_bytes = fig.to_image(format="svg").encode("utf-8")
+            st.download_button(
+                "⬇️ Export as SVG", data=svg_bytes, file_name="chart.svg",
+                mime="image/svg+xml", key=f"{key_prefix}_svg",
+            )
+        except Exception:
+            st.caption("SVG export needs the `kaleido` package: `pip install -U kaleido`.")
 
 
 # ==========================================================================
@@ -521,8 +582,9 @@ def render_header(df_filtered: pd.DataFrame, df_full: pd.DataFrame) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Observations (filtered)", f"{len(df_filtered):,}")
     c2.metric("Total Observations", f"{len(df_full):,}")
-    c3.metric("Start Date", df_full[DATE_COL].min().strftime("%Y-%m-%d"))
-    c4.metric("End Date", df_full[DATE_COL].max().strftime("%Y-%m-%d"))
+    if not df_full.empty:
+        c3.metric("Start Date", df_full[DATE_COL].min().strftime("%Y-%m-%d"))
+        c4.metric("End Date", df_full[DATE_COL].max().strftime("%Y-%m-%d"))
     st.divider()
 
 
@@ -531,29 +593,50 @@ def render_header(df_filtered: pd.DataFrame, df_full: pd.DataFrame) -> None:
 # ==========================================================================
 def render_correlation_tab(df: pd.DataFrame) -> None:
     st.subheader("Correlation Analysis")
-    st.caption("Pearson correlation across the core volume and ratio variables.")
+    st.caption("Pearson correlation across the core volume and ratio variables (per instrument).")
 
-    corr_df = df[CORRELATION_COLS].corr()
+    if df.empty:
+        st.info("No data available for correlation analysis.")
+        return
 
-    fig = px.imshow(
-        corr_df, text_auto=".2f", color_continuous_scale="RdBu", zmin=-1, zmax=1,
-        aspect="auto", labels=dict(color="Correlation"),
-    )
-    fig.update_traces(hovertemplate="%{x} vs %{y}: %{z:.3f}<extra></extra>")
-    fig.update_layout(title="Correlation Matrix", height=650, xaxis_title="", yaxis_title="")
-    st.plotly_chart(fig, width='stretch', config={"displaylogo": False})
+    instruments = df[INSTRUMENT_COL].unique()
 
-    with st.expander("View correlation values as a table"):
-        st.dataframe(
-            corr_df.style.format("{:.3f}").background_gradient(cmap="RdBu", vmin=-1, vmax=1),
-            width='stretch',
+    for instr in sorted(instruments):
+        df_instr = df[df[INSTRUMENT_COL] == instr]
+        instr_name = INSTRUMENT_MAP.get(instr, instr)
+        
+        st.write(f"**{instr_name} Options**")
+        
+        available_cols = [c for c in CORRELATION_COLS if c in df_instr.columns]
+        if not available_cols:
+            st.info(f"No correlation data available for {instr_name} options.")
+            continue
+            
+        corr_df = df_instr[available_cols].corr()
+
+        fig = px.imshow(
+            corr_df, text_auto=".2f", color_continuous_scale="RdBu", zmin=-1, zmax=1,
+            aspect="auto", labels=dict(color="Correlation"),
         )
+        fig.update_traces(hovertemplate="%{x} vs %{y}: %{z:.3f}<extra></extra>")
+        fig.update_layout(title=f"Correlation Matrix - {instr_name}", height=500, xaxis_title="", yaxis_title="")
+        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
-    csv_bytes = corr_df.to_csv().encode("utf-8")
-    st.download_button(
-        "⬇️ Download correlation matrix (CSV)", data=csv_bytes,
-        file_name="correlation_matrix.csv", mime="text/csv",
-    )
+        with st.expander(f"View {instr_name} correlation values as table"):
+            st.dataframe(
+                corr_df.style.format("{:.3f}").background_gradient(cmap="RdBu", vmin=-1, vmax=1),
+                use_container_width=True,
+            )
+
+        csv_bytes = corr_df.to_csv().encode("utf-8")
+        st.download_button(
+            f"⬇️ Download {instr_name} correlation matrix (CSV)",
+            data=csv_bytes,
+            file_name=f"correlation_matrix_{instr}.csv",
+            mime="text/csv",
+            key=f"corr_csv_{instr}",
+        )
+        st.divider()
 
 
 # ==========================================================================
@@ -561,6 +644,10 @@ def render_correlation_tab(df: pd.DataFrame) -> None:
 # ==========================================================================
 def render_data_table_tab(df: pd.DataFrame) -> None:
     st.subheader("Interactive Data Table")
+
+    if df.empty:
+        st.info("No data available to display.")
+        return
 
     search = st.text_input("🔍 Search (matches any column, case-insensitive)", value="")
 
@@ -574,7 +661,7 @@ def render_data_table_tab(df: pd.DataFrame) -> None:
         display_df = display_df[mask]
 
     st.caption(f"Showing {len(display_df):,} of {len(df):,} rows. Click column headers to sort.")
-    st.dataframe(display_df, width='stretch', height=520)
+    st.dataframe(display_df, use_container_width=True, height=520)
 
     csv_bytes = display_df.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -615,6 +702,9 @@ def main() -> None:
 
     try:
         df_raw = load_data(file_bytes)
+        if df_raw.empty:
+            st.error("No data loaded. Please upload a CSV file.")
+            st.stop()
     except Exception as exc:
         st.error(f"Failed to load dataset: {exc}")
         st.stop()
@@ -629,7 +719,9 @@ def main() -> None:
     window = ROLLING_WINDOW_MAP[settings["rolling_window_label"]]
     if settings["rolling_enabled"] and window:
         df_filtered = apply_rolling_average(
-            df_filtered, window, settings["variables"], settings["include_volumes_in_rolling"]
+            df_filtered, window,
+            [col for _, col in settings["selected_vars"]],
+            settings["include_volumes_in_rolling"]
         )
 
     render_header(df_filtered, df_raw)
@@ -639,13 +731,13 @@ def main() -> None:
     )
 
     with tab_explorer:
-        if not settings["variables"]:
+        if not settings["selected_vars"]:
             st.info("Select at least one variable from the sidebar to plot.")
         elif df_filtered.empty:
             st.warning("No data in the selected date range.")
         else:
-            fig = build_main_figure(df_filtered, settings["variables"], settings)
-            st.plotly_chart(fig, width='stretch', config={"displaylogo": False})
+            fig = build_main_figure(df_filtered, settings["selected_vars"], settings)
+            st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
             render_export_buttons(fig, key_prefix="explorer")
 
     with tab_corr:
