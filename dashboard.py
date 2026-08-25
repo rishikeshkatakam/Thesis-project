@@ -35,6 +35,8 @@ dataset so it always runs end-to-end without modification.
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
@@ -46,6 +48,27 @@ from plotly.subplots import make_subplots
 from scipy import stats
 
 import streamlit as st
+
+# ==========================================================================
+# Kaleido installation & import
+# ==========================================================================
+def ensure_kaleido_installed():
+    """Attempt to import kaleido; if not available, install it silently."""
+    try:
+        import kaleido
+        return True
+    except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "-q", "kaleido"],
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:
+            return False
+
+# Try to ensure kaleido is available
+_KALEIDO_AVAILABLE = ensure_kaleido_installed()
 
 # ==========================================================================
 # Page configuration (must be the first Streamlit call in the script)
@@ -87,7 +110,14 @@ RATIO_COLS: List[str] = [
     "otm_put_ratio",
 ]
 
-ALL_NUMERIC_COLS: List[str] = VOLUME_COLS + RATIO_COLS
+# New moneyness-based put-call ratio columns
+MONEYNESS_PUT_CALL_RATIO_COLS: List[str] = [
+    "itm_put_call_ratio",
+    "atm_put_call_ratio",
+    "otm_put_call_ratio",
+]
+
+ALL_NUMERIC_COLS: List[str] = VOLUME_COLS + RATIO_COLS + MONEYNESS_PUT_CALL_RATIO_COLS
 
 CORRELATION_COLS: List[str] = [
     "total_volume",
@@ -99,6 +129,9 @@ CORRELATION_COLS: List[str] = [
     "itm_put_ratio",
     "atm_put_ratio",
     "otm_put_ratio",
+    "itm_put_call_ratio",
+    "atm_put_call_ratio",
+    "otm_put_call_ratio",
 ]
 
 # Instrument mapping
@@ -140,6 +173,29 @@ def _optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_moneyness_put_call_ratios(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute put-call ratios for each moneyness level (ITM, ATM, OTM).
+    itm_put_call_ratio = itm_put_volume / itm_call_volume
+    atm_put_call_ratio = atm_put_volume / atm_call_volume
+    otm_put_call_ratio = otm_put_volume / otm_call_volume
+    """
+    df = df.copy()
+    
+    # ITM Put-Call Ratio
+    if "itm_put_volume" in df.columns and "itm_call_volume" in df.columns:
+        df["itm_put_call_ratio"] = df["itm_put_volume"] / df["itm_call_volume"].replace(0, np.nan)
+    
+    # ATM Put-Call Ratio
+    if "atm_put_volume" in df.columns and "atm_call_volume" in df.columns:
+        df["atm_put_call_ratio"] = df["atm_put_volume"] / df["atm_call_volume"].replace(0, np.nan)
+    
+    # OTM Put-Call Ratio
+    if "otm_put_volume" in df.columns and "otm_call_volume" in df.columns:
+        df["otm_put_call_ratio"] = df["otm_put_volume"] / df["otm_call_volume"].replace(0, np.nan)
+    
+    return df
+
+
 @st.cache_data(show_spinner="Loading and preparing dataset...")
 def load_data(file_bytes: Optional[bytes]) -> pd.DataFrame:
     """Load the raw dataset from an uploaded CSV's bytes, parse dates,
@@ -151,7 +207,8 @@ def load_data(file_bytes: Optional[bytes]) -> pd.DataFrame:
         # Fallback: return empty dataframe
         return pd.DataFrame()
 
-    missing = [c for c in [DATE_COL, INSTRUMENT_COL] + ALL_NUMERIC_COLS if c not in df.columns]
+    required_cols = [DATE_COL, INSTRUMENT_COL] + VOLUME_COLS + RATIO_COLS
+    missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Dataset is missing required columns: {missing}")
 
@@ -162,6 +219,10 @@ def load_data(file_bytes: Optional[bytes]) -> pd.DataFrame:
         st.warning(f"Dropped {n_before - len(df):,} row(s) with unparsable '{DATE_COL}' values.")
 
     df = df.sort_values([DATE_COL, INSTRUMENT_COL]).reset_index(drop=True)
+    
+    # Compute moneyness-based put-call ratios
+    df = compute_moneyness_put_call_ratios(df)
+    
     df = _optimize_dtypes(df)
     return df
 
@@ -177,6 +238,7 @@ def aggregate_data(df: pd.DataFrame, freq_label: str) -> pd.DataFrame:
     rule = AGG_RULE_MAP[freq_label]
     agg_map: Dict[str, str] = {c: "sum" for c in VOLUME_COLS}
     agg_map.update({c: "mean" for c in RATIO_COLS})
+    agg_map.update({c: "mean" for c in MONEYNESS_PUT_CALL_RATIO_COLS})
 
     out = (
         df.set_index(DATE_COL)
@@ -201,26 +263,15 @@ def apply_rolling_average(
     the selected variables are smoothed; volume columns are included only
     if the user explicitly opts in."""
     df = df.copy()
+    all_ratio_cols = RATIO_COLS + MONEYNESS_PUT_CALL_RATIO_COLS
     target_cols = [
-        c for c in columns if (c in RATIO_COLS) or (include_volumes and c in VOLUME_COLS)
+        c for c in columns if (c in all_ratio_cols) or (include_volumes and c in VOLUME_COLS)
     ]
     for instr in df[INSTRUMENT_COL].unique():
         mask = df[INSTRUMENT_COL] == instr
         for c in target_cols:
             if c in df.columns:
                 df.loc[mask, c] = df.loc[mask, c].rolling(window=window, min_periods=1).mean()
-    return df
-
-
-def create_prefixed_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Create new columns with instrument prefixes for display in dropdowns."""
-    df = df.copy()
-    for idx, row in df.iterrows():
-        instrument_prefix = INSTRUMENT_MAP.get(row[INSTRUMENT_COL], row[INSTRUMENT_COL])
-        for col in ALL_NUMERIC_COLS:
-            if col in df.columns:
-                prefixed_col = f"{instrument_prefix} {col.replace('_', ' ').title()}"
-                df.loc[idx, prefixed_col] = df.loc[idx, col]
     return df
 
 
@@ -355,7 +406,7 @@ def build_main_figure(
     (formatted as %) when both volume and ratio variables are selected
     together."""
     has_volume = any(col in VOLUME_COLS for _, col in selected_vars)
-    has_ratio = any(col in RATIO_COLS for _, col in selected_vars)
+    has_ratio = any(col in RATIO_COLS + MONEYNESS_PUT_CALL_RATIO_COLS for _, col in selected_vars)
     use_secondary = has_volume and has_ratio
 
     fig = make_subplots(specs=[[{"secondary_y": use_secondary}]])
@@ -364,11 +415,11 @@ def build_main_figure(
 
     for i, (instrument, col) in enumerate(selected_vars):
         color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
-        is_ratio = col in RATIO_COLS
+        is_ratio = col in RATIO_COLS + MONEYNESS_PUT_CALL_RATIO_COLS
         secondary_y = use_secondary and is_ratio
 
         df_instr = df[df[INSTRUMENT_COL] == instrument].copy()
-        if df_instr.empty:
+        if df_instr.empty or col not in df_instr.columns:
             continue
 
         x = df_instr[DATE_COL]
@@ -543,30 +594,39 @@ def render_export_buttons(fig: go.Figure, key_prefix: str) -> None:
     """Explicit PNG/HTML/SVG export buttons, in addition to the built-in
     camera icon already available in every Plotly chart's toolbar."""
     col1, col2, col3 = st.columns(3)
+    
     with col1:
-        try:
-            png_bytes = fig.to_image(format="png", scale=2)
-            st.download_button(
-                "⬇️ Export as PNG", data=png_bytes, file_name="chart.png",
-                mime="image/png", key=f"{key_prefix}_png",
-            )
-        except Exception:
-            st.caption("PNG export needs the `kaleido` package: `pip install -U kaleido`.")
+        if _KALEIDO_AVAILABLE:
+            try:
+                png_bytes = fig.to_image(format="png", scale=2)
+                st.download_button(
+                    "⬇️ Export as PNG", data=png_bytes, file_name="chart.png",
+                    mime="image/png", key=f"{key_prefix}_png",
+                )
+            except Exception as e:
+                st.caption(f"PNG export error: {str(e)[:50]}")
+        else:
+            st.caption("⚠️ PNG export unavailable (kaleido installing...)")
+    
     with col2:
         html_bytes = fig.to_html(include_plotlyjs="cdn").encode("utf-8")
         st.download_button(
             "⬇️ Export as HTML", data=html_bytes, file_name="chart.html",
             mime="text/html", key=f"{key_prefix}_html",
         )
+    
     with col3:
-        try:
-            svg_bytes = fig.to_image(format="svg").encode("utf-8")
-            st.download_button(
-                "⬇️ Export as SVG", data=svg_bytes, file_name="chart.svg",
-                mime="image/svg+xml", key=f"{key_prefix}_svg",
-            )
-        except Exception:
-            st.caption("SVG export needs the `kaleido` package: `pip install -U kaleido`.")
+        if _KALEIDO_AVAILABLE:
+            try:
+                svg_bytes = fig.to_image(format="svg").encode("utf-8")
+                st.download_button(
+                    "⬇️ Export as SVG", data=svg_bytes, file_name="chart.svg",
+                    mime="image/svg+xml", key=f"{key_prefix}_svg",
+                )
+            except Exception as e:
+                st.caption(f"SVG export error: {str(e)[:50]}")
+        else:
+            st.caption("⚠️ SVG export unavailable (kaleido installing...)")
 
 
 # ==========================================================================
